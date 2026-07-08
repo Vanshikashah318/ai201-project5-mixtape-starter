@@ -101,3 +101,52 @@ This restores the intended rule (increment on a one-day gap regardless of weekda
 - `pytest tests/test_streaks.py` → all 5 pass, including `test_streak_increments_on_sunday`, the test that directly covers this case.
 
 **AI usage:** I used Claude Code to help trace the route→service call chain and to confirm what `datetime.weekday()` returns for Sunday. I verified the diagnosis myself by running the reproduction with controlled inputs before changing any code.
+
+### Issue #2 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it**
+
+I used two methods:
+
+1. *Controlled inputs (deterministic):* built an isolated scenario — a viewer and a friend whose only listening event was timestamped "yesterday 23:00" — then called `get_friends_listening_now(viewer)`. The friend appeared in the feed even though the listen was the previous evening. I ran this inside `db.session.rollback()` so nothing persisted.
+2. *Seed data confirmation:* because the DB had been seeded the prior evening (~22:41 UTC) and I was now testing after 00:00 UTC the next day, all of nova's friends' most-recent seeded listens fell on the previous calendar day (~23:2x). Fetching nova's feed under the old rule showed simone, darius, and kenji as "listening now" — a direct recreation of the reported bug ("darius listening now to a song he played at 11pm last night"). I also confirmed this live via `GET /feed/<nova_id>/listening-now`.
+
+Note the seed-data method is time-dependent: it only reproduces once the clock has crossed into a new UTC day relative to the seed timestamps. The controlled-input method reproduces at any time.
+
+**How I found the root cause**
+
+I traced from the route `GET /feed/<user_id>/listening-now` ([routes/feed.py](routes/feed.py)) → `get_friends_listening_now()` in [services/feed_service.py](services/feed_service.py). The two lines that defined "recent" stood out:
+
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+```
+
+The moment of confidence: the endpoint's contract is "friends listening *now* / today," but `now - 24h` is a rolling window, not a calendar boundary. I verified by printing each friend's last-listen timestamp alongside both an `old_cutoff = now - 24h` and a `new_cutoff = midnight today`, and confirmed the yesterday-evening events satisfied the old cutoff but not the calendar-day one.
+
+**The root cause**
+
+"Recent" was defined as a **rolling 24-hour window** (`datetime.now() - timedelta(hours=24)`) rather than the **current calendar day**. A listen at 11pm is only ~10 hours old at 9am the next morning, so it stays inside the 24-hour window and keeps appearing in "Listening Now" until it individually ages past 24 hours — i.e., until the same time the next day. The two concepts ("last 24 hours" vs "today") only coincide at midnight; at every other time the rolling window leaks in part of the previous day.
+
+**My fix and side-effect check**
+
+I replaced the rolling threshold with a calendar-day cutoff — midnight of the current UTC day:
+
+```python
+now = datetime.now(timezone.utc)
+cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+```
+
+`.replace(...)` keeps the current date but zeroes the time fields, giving the start of today. The downstream filter `ListeningEvent.listened_at >= cutoff` then admits only events dated today. I also removed the now-unused `RECENT_THRESHOLD` constant and the `timedelta` import.
+
+Side-effect check (both sides of the boundary, since this is a boundary bug):
+- Friend who listened yesterday 23:00 → **not** shown (fixed).
+- Friend who listened today 00:05 (just past the boundary) → **still** shown (didn't over-filter).
+- `get_activity_feed`, which lives in the same file and reads the same events, was checked and is unaffected — it intentionally does not use `cutoff`.
+- Live curl against a freshly restarted server: nova's feed returns `count: 0` (all friends listened yesterday), and after posting a fresh "today" listen for darius, darius correctly reappears.
+
+There is no `test_feed.py` in the suite, so verification was via the reproduction scripts and live curl. This bug is a good candidate for the stretch regression test (a `test_feed.py` asserting the two boundary cases).
+
+**Limitation noted:** "today" is defined in UTC, consistent with how the app stores all timestamps. For a user in a non-UTC timezone, the day boundary flips at 00:00 UTC rather than their local midnight. Making it match the user's local day would require per-user timezone handling, which is out of scope for this fix.
+
+**AI usage:** I used Claude Code to help trace the route→service chain, to explain how `.replace()` produces a midnight timestamp, and to run the reproduction/boundary checks. I confirmed the rolling-window-vs-calendar-day diagnosis myself before editing.
