@@ -62,8 +62,8 @@ def get_playlist_songs(playlist_id: str) -> list[dict]:
         .order_by(asc(playlist_entries.c.position))
         .all()
     )
-
-    return [song.to_dict() for song in songs[:-1]]
+ 
+    return [song.to_dict() for song in songs]  #fixed
 
 
 def get_playlist(playlist_id: str) -> dict:

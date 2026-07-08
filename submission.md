@@ -150,3 +150,45 @@ There is no `test_feed.py` in the suite, so verification was via the reproductio
 **Limitation noted:** "today" is defined in UTC, consistent with how the app stores all timestamps. For a user in a non-UTC timezone, the day boundary flips at 00:00 UTC rather than their local midnight. Making it match the user's local day would require per-user timezone handling, which is out of scope for this fix.
 
 **AI usage:** I used Claude Code to help trace the route→service chain, to explain how `.replace()` produces a midnight timestamp, and to run the reproduction/boundary checks. I confirmed the rolling-window-vs-calendar-day diagnosis myself before editing.
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it**
+
+I compared two independent counts of the same thing: how many songs are actually stored in a playlist versus how many the service returns. For each seeded playlist I queried the `playlist_entries` join table directly (the ground truth, which bypasses the buggy function) and also called `get_playlist_songs()`:
+
+- Friday Energy: stored **7**, returned **6**
+- Late Night Vibes: stored **7**, returned **6**
+- Study Mode: stored **7**, returned **6**
+
+Every playlist returned exactly one fewer song than it contained, matching darius's report that "Friday Energy says 7 songs but only 6 show." Because the two measurements are independent (raw table vs. service function), the mismatch proves the function is dropping a song.
+
+**How I found the root cause**
+
+I traced from the route `GET /playlists/<id>/songs` ([routes/playlists.py](routes/playlists.py)) → `get_playlist_songs()` in [services/playlist_service.py](services/playlist_service.py). The query itself was correct — it joins `playlist_entries`, filters by playlist, and orders ascending by `position`. The bug was in the very last line:
+
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+
+The moment of confidence: `songs[:-1]` is a Python slice meaning "every element except the last one." Since the results are ordered ascending by `position`, the last element is always the highest-position = most-recently-added song. The function's own docstring says "This function returns all songs in the playlist," which the code contradicts — confirming this line was the actual cause, not just a suspicious spot. It also explains darius's odd observation that adding a new song "frees" the previously-missing one: the old last song is no longer last, so it reappears, and the brand-new song becomes the one sliced off.
+
+**The root cause**
+
+`get_playlist_songs` correctly queried and ordered all playlist entries by `position`, but the return statement sliced the list with `songs[:-1]`, which discards the final element. Because the list is sorted ascending by position, the final element is always the most-recently-added song, so every call silently omitted exactly one song — the newest one.
+
+**My fix and side-effect check**
+
+I removed the slice so the comprehension iterates the full list:
+
+```python
+return [song.to_dict() for song in songs]
+```
+
+That is the entire change — one slice removed, nothing else touched. Side-effect check:
+- Re-ran the reproduction: all three playlists now report stored=7, returned=7 (no song dropped).
+- `pytest tests/test_playlists.py` → all pass, including the test that a newly added song is returned (which the `[:-1]` version failed).
+- Boundary check: an empty playlist still returns `[]` — with the bug `[][:-1]` was also `[]`, so this case was unchanged and does not error.
+- Ran the full suite (`pytest tests/`) to confirm the streak and feed fixes still pass alongside this one.
+
+**AI usage:** I used Claude Code to help locate `get_playlist_songs` from the route and to explain Python's `[:-1]` slice semantics. I verified the off-by-one myself by comparing the raw-table count against the function's output before and after the change.
