@@ -1,5 +1,21 @@
 # Project 5 — Mixtape Bug Hunt — Submission
 
+## AI Usage
+
+I used Claude Code (an AI coding assistant) throughout this project, mostly for **navigation and debugging** rather than writing code. Here is specifically how, and where I had to verify or correct it.
+
+**Codebase orientation.** I had the AI help me summarize each service file's responsibility and trace call chains (e.g., "how does rating a song reach a notification?"). This let me build the codebase map faster than reading every file cold. I confirmed each traced chain by reading the route and service files myself.
+
+**Explaining code I'd already found.** Once I'd narrowed a bug to a specific function, I used the AI to explain unfamiliar pieces — what `datetime.weekday()` returns for each day, what Python's `[:-1]` slice does, and how `datetime.replace(hour=0, ...)` produces a midnight timestamp. These were "explain this thing I'm looking at" questions, not "find the bug for me" questions.
+
+**Reproduction and verification.** The AI helped me write small reproduction scripts (driving service functions directly with controlled inputs, wrapped in `db.session.rollback()` so nothing persisted) and interpret test output. This was genuinely useful for the streak bug, which only triggers on Sundays and couldn't be reproduced through the live endpoint on a non-Sunday.
+
+**Where I had to verify / where AI was wrong:**
+- **Issue #3 (search duplicates):** the AI's first hypothesis was that the `outerjoin(song_tags)` would return one duplicated row per tag, so a 3-tag song would appear 3 times. When I actually reproduced it, the search returned each song **once** and the existing test passed. Investigating further showed SQLAlchemy 2.0's legacy `session.query(Song).all()` auto-deduplicates entity rows by primary key, so the fan-out is masked. The duplication is real at the SQL level (raw SQL and the `select()` API return 3 rows) but latent through the shipped code path. This is the clearest case where reproducing *before* trusting the explanation changed the conclusion.
+- **Issue #1 control experiment:** my first "control" for the streak fix compared a Saturday listen against a Monday listen using the same Saturday baseline — but Saturday→Monday is a 2-day gap, which correctly resets, so the control looked like it "also failed." Running it exposed the flawed test setup; I fixed the controls to use true consecutive-day gaps before drawing conclusions.
+
+**What I did myself:** I made all the source-code edits, ran the commands, formed and checked each hypothesis against actual output before changing code, and made every commit. The AI accelerated reading and reproduction; the diagnoses were confirmed by running the code.
+
 ## Codebase Map
 
 ### Main files and what each does
